@@ -9,7 +9,7 @@ Usage:
   gh pr diff 42 | python3 review.py --repo owner/repo --pr 42 --db index.db
   python3 review.py --diff-file /tmp/pr.diff --db index.db --repo owner/repo --pr 42
 """
-import os, sys, json, argparse, tempfile, requests, time
+import os, sys, json, argparse, tempfile, requests, time, subprocess
 from pathlib import Path
 
 OLLAMA_BASE    = os.environ.get("OLLAMA_BASE_URL",    "http://localhost:43311")
@@ -129,9 +129,9 @@ def parse_review(response: str) -> dict:
         if line.startswith("**Finding**"):
             if current:
                 findings.append(current)
-            current = {"finding": line.split("**Finding**", 1)[1].strip(), "severity": "Medium"}
+            current = {"finding": line.split("**Finding**", 1)[1].split("**", 1)[0].strip().rstrip(":"), "severity": "Medium"}
         elif line.startswith("**Severity**"):
-            current["severity"] = line.split("**Severity**", 1)[1].strip()
+            current["severity"] = line.split("**Severity**", 1)[1].split("**", 1)[0].strip().rstrip(":")
         elif line.startswith("**Location**"):
             current["location"] = line.split("**Location**", 1)[1].strip()
         elif line.startswith("**Suggestion**"):
@@ -144,6 +144,48 @@ def parse_review(response: str) -> dict:
         "findings": findings,
         "summary": "N findings" if findings else "No issues found — LGTM!"
     }
+
+
+def format_comment(result: dict, repo: str, pr_num: int) -> str:
+    """Format review result as a GitHub-flavoured Markdown comment."""
+    lines = [
+        "## 🤖 Riptide Code Review",
+        "",
+        result["summary"],
+        "",
+    ]
+    if result["findings"]:
+        lines.append("### Findings")
+        for i, f in enumerate(result["findings"], 1):
+            lines.append(f"\n**{i}. {f['finding']}**")
+            lines.append(f"- **Severity:** {f.get('severity', 'Medium')}")
+            if f.get("location"):
+                lines.append(f"- **Location:** {f['location']}")
+            if f.get("suggestion"):
+                lines.append(f"- **Suggestion:** {f['suggestion']}")
+    else:
+        lines.append("\n_No issues detected._")
+
+    lines.append(f"\n---\n*Reviewed by Riptide · {result.get('model', REVIEW_MODEL)}*")
+    return "\n".join(lines)
+
+
+def post_review_comment(repo: str, pr_num: int, body: str, dry_run: bool = False):
+    """Post a comment to the PR using gh."""
+    if dry_run:
+        print(f"[dry-run] would post to {repo}#{pr_num}:\n{body[:200]}...", file=sys.stderr)
+        return True
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "comment", str(pr_num),
+             "--repo", repo, "--body", body],
+            capture_output=True, text=True, check=True
+        )
+        print(f"[review] comment posted: {result.stdout.strip()}", file=sys.stderr)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[review] gh pr comment failed: {e.stderr.strip()}", file=sys.stderr)
+        return False
 
 
 def run_review(diff_content: str, repo: str, pr_num: int,
@@ -159,18 +201,19 @@ def run_review(diff_content: str, repo: str, pr_num: int,
     print(f"[review] calling LLM ({model})...", file=sys.stderr)
     t1 = time.time()
     response = llm_review(prompt, model=model)
-    print(f"[review] LLM responded in {time.time()-t1:.1f}s", file=sys.stderr)
+    elapsed = time.time() - t1
+    print(f"[review] LLM responded in {elapsed:.1f}s", file=sys.stderr)
 
     result = parse_review(response)
+    result["model"] = model
+    result["elapsed"] = elapsed
 
     # Log
     os.makedirs(os.path.dirname(REVIEW_LOG) or ".", exist_ok=True)
     with open(REVIEW_LOG, "a") as f:
         f.write(f"\n{'='*60}\n")
-        f.write(f"PR: {repo}#{pr_num}\n")
-        f.write(f"Model: {model}\n")
-        f.write(f"Context chunks: {len(ctx)}\n")
-        f.write(f"Response time: {time.time()-t1:.1f}s\n")
+        f.write(f"PR: {repo}#{pr_num}\nModel: {model}\n")
+        f.write(f"Context chunks: {len(ctx)}\nElapsed: {elapsed:.1f}s\n")
         f.write(f"\n{response}\n")
 
     return result
@@ -187,6 +230,11 @@ def main():
     parser.add_argument("--model", default=REVIEW_MODEL)
     parser.add_argument("--context-k", type=int, default=RETRIEVE_TOP_K)
     parser.add_argument("--no-context", action="store_true")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print comment to stdout instead of posting to GitHub")
+    parser.add_argument("--post", action="store_true", dest="post",
+                        help="Post the review comment to GitHub (default if not dry-run)")
+    parser.set_defaults(post=False)
     args = parser.parse_args()
 
     # Read diff
@@ -203,21 +251,23 @@ def main():
     print(f"[review] diff size: {len(diff_content)} chars", file=sys.stderr)
     result = run_review(diff_content, args.repo, args.pr, args.db, model=args.model)
 
-    # Output
-    print("\n## Review Summary")
-    print(result["summary"])
-    if result["findings"]:
-        print(f"\n### Findings ({len(result['findings'])})")
-        for i, f in enumerate(result["findings"], 1):
-            print(f"\n{i}. **{f['finding']}**")
-            print(f"   Severity: {f.get('severity','Medium')}")
-            if f.get("location"):
-                print(f"   Location: {f['location']}")
-            if f.get("suggestion"):
-                print(f"   Suggestion: {f['suggestion']}")
+    # Format and optionally post comment
+    dry_run = args.dry_run or not args.post
+    comment_body = format_comment(result, args.repo, args.pr)
+
+    if dry_run:
+        print("\n" + "=" * 60)
+        print(f"DRY RUN — would post to {args.repo}#{args.pr}:")
+        print("=" * 60)
+        print(comment_body)
     else:
-        print("\nNo issues found.")
-    print(f"\n(Full response logged to {REVIEW_LOG})")
+        success = post_review_comment(args.repo, args.pr, comment_body, dry_run=False)
+        if success:
+            print("## Review Summary")
+            print(result["summary"])
+        else:
+            print("Failed to post comment.", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
